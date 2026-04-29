@@ -28,6 +28,8 @@ pub fn capture_log() -> Result<Vec<Row>> {
             "--ignore-working-copy",
             "log",
             "--color=always",
+            "-r",
+            "all()",
             "--limit",
             "1000",
             "-T",
