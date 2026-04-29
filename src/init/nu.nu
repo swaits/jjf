@@ -12,5 +12,6 @@ def --env jjf [...args] {
     let cmd = ($result.stdout | str trim)
     if ($cmd | is-empty) { exit 130 }
     [{command: $cmd, start_timestamp: (date now | format date "%+")}] | history import
+    print $"(ansi grey)$(ansi reset) ($cmd)"
     ^sh -c $cmd
 }

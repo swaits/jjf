@@ -12,6 +12,7 @@ jjf() {
     _jjf_cmd="$(command jjf --emit "$@")" || return $?
     [ -n "$_jjf_cmd" ] || return 130
     print -s -- "$_jjf_cmd"
+    printf '\033[2m$\033[0m %s\n' "$_jjf_cmd"
     sh -c "$_jjf_cmd"
 }
 

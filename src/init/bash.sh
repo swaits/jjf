@@ -24,5 +24,6 @@ jjf() {
         return $_jjf_rc
     fi
     history -s -- "$_jjf_cmd"
+    printf '\033[2m$\033[0m %s\n' "$_jjf_cmd"
     sh -c "$_jjf_cmd"
 }

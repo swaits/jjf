@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -16,13 +17,42 @@ const VIEWPORT_MIN: u16 = 15;
 const SGR_RESET: &[u8] = b"\x1b[0m";
 const SGR_RESET_SHORT: &[u8] = b"\x1b[m";
 const SGR_DIM: &[u8] = b"\x1b[2m";
+const SGR_NORMAL_WEIGHT: &[u8] = b"\x1b[22m";
 const SGR_BOLD: &[u8] = b"\x1b[1m";
 const SGR_FG_CYAN: &[u8] = b"\x1b[36m";
 const SGR_FG_YELLOW: &[u8] = b"\x1b[33m";
-const SGR_BG_CURSOR: &[u8] = b"\x1b[48;5;237m";
 const ERASE_TO_EOL: &[u8] = b"\x1b[K";
 const ERASE_TO_END: &[u8] = b"\x1b[J";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+
+// Synchronized output (DEC Mode 2026): Kitty / WezTerm / foot / recent iTerm
+// honor these brackets and present the buffered redraw atomically; other
+// terminals ignore them. Eliminates tearing on supported terminals.
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+
+/// The cursor-row "highlight" SGR. Dark gray bg on dark themes, reverse
+/// video on light themes (since indexed-color 237 disappears on light).
+fn cursor_bg() -> &'static [u8] {
+    static CACHE: OnceLock<&'static [u8]> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        if is_light_terminal() {
+            b"\x1b[7m"
+        } else {
+            b"\x1b[48;5;237m"
+        }
+    })
+}
+
+fn is_light_terminal() -> bool {
+    if let Ok(v) = std::env::var("COLORFGBG")
+        && let Some(bg_str) = v.split(';').next_back()
+        && let Ok(bg) = bg_str.parse::<u8>()
+    {
+        return bg == 7 || bg == 15;
+    }
+    false
+}
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 
 struct App {
@@ -398,6 +428,7 @@ fn render(
     term_cols: u16,
 ) -> Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    buf.extend_from_slice(SYNC_BEGIN);
     let log_height = app.last_height;
 
     let preview_enabled = term_cols >= PREVIEW_MIN_COLS;
@@ -411,14 +442,26 @@ fn render(
     };
 
     // Pre-compute preview lines (cached) for the cursor row, before borrowing app immutably.
-    let preview_lines: Vec<Vec<u8>> = if preview_enabled {
+    // The first preview row is a dim header anchoring the pane to the cursor's change ID.
+    let (preview_header, preview_lines): (Option<Vec<u8>>, Vec<Vec<u8>>) = if preview_enabled {
         if let Some(&row_idx) = app.filtered.get(app.cursor) {
-            split_lines(app.preview_for(row_idx))
+            let cid = if app.rows[row_idx].change_id_prefix.is_empty() {
+                app.rows[row_idx].change_id_short.clone()
+            } else {
+                app.rows[row_idx].change_id_prefix.clone()
+            };
+            let label = format!("── {cid} ");
+            let dashes = right_w.saturating_sub(label.chars().count());
+            let header = format!(
+                "\x1b[2m{label}{}\x1b[0m",
+                "─".repeat(dashes)
+            );
+            (Some(header.into_bytes()), split_lines(app.preview_for(row_idx)))
         } else {
-            Vec::new()
+            (None, Vec::new())
         }
     } else {
-        Vec::new()
+        (None, Vec::new())
     };
 
     // Input row (left only).
@@ -428,9 +471,9 @@ fn render(
     buf.extend_from_slice("❯ ".as_bytes());
     buf.extend_from_slice(SGR_RESET);
     buf.extend_from_slice(app.filter.as_bytes());
-    buf.extend_from_slice(SGR_FG_CYAN);
-    buf.extend_from_slice("█".as_bytes());
-    buf.extend_from_slice(SGR_RESET);
+    // Reverse-video caret on a single space — matches fzf/lazygit/telescope
+    // convention; survives any colorscheme without competing with the cyan ❯.
+    buf.extend_from_slice(b"\x1b[7m \x1b[27m");
     buf.extend_from_slice(ERASE_TO_EOL);
 
     // Log rows.
@@ -458,13 +501,19 @@ fn render(
         if preview_enabled {
             write!(buf, "\x1b[{};{}H", row_y, right_x + 1)?;
             buf.extend_from_slice(ERASE_TO_EOL);
-            buf.extend_from_slice(SGR_DIM);
-            buf.extend_from_slice("│ ".as_bytes());
-            buf.extend_from_slice(SGR_RESET);
-            if let Some(line) = preview_lines.get(i) {
-                let clipped = truncate_ansi(line, right_w.saturating_sub(2));
-                buf.extend_from_slice(&clipped);
+            if i == 0 {
+                if let Some(h) = &preview_header {
+                    buf.extend_from_slice(h);
+                }
+            } else {
+                buf.extend_from_slice(SGR_DIM);
+                buf.extend_from_slice("│ ".as_bytes());
                 buf.extend_from_slice(SGR_RESET);
+                if let Some(line) = preview_lines.get(i - 1) {
+                    let clipped = truncate_ansi(line, right_w.saturating_sub(2));
+                    buf.extend_from_slice(&clipped);
+                    buf.extend_from_slice(SGR_RESET);
+                }
             }
         }
     }
@@ -482,11 +531,16 @@ fn render(
             app.selected.len()
         )
     };
+    // Two-tone hint: keys at normal weight, labels dim. Gives the eye an anchor
+    // to scan by without removing any information.
     buf.extend_from_slice(SGR_DIM);
     buf.extend_from_slice(counts.as_bytes());
-    buf.extend_from_slice(
-        "type filter · ↑↓/^N^P nav · tab select · enter run · ^U clear · esc quit".as_bytes(),
-    );
+    buf.extend_from_slice(b"type filter");
+    write_hint_pair(&mut buf, "↑↓/^N^P".as_bytes(), b"nav");
+    write_hint_pair(&mut buf, b"tab", b"select");
+    write_hint_pair(&mut buf, b"enter", b"run");
+    write_hint_pair(&mut buf, b"^U", b"clear");
+    write_hint_pair(&mut buf, b"esc", b"quit");
     buf.extend_from_slice(SGR_RESET);
     buf.extend_from_slice(ERASE_TO_EOL);
 
@@ -500,9 +554,19 @@ fn render(
     write!(buf, "\x1b[{};{}H", viewport_y + 1, input_col + 1)?;
 
     let _ = viewport_height;
+    buf.extend_from_slice(SYNC_END);
     tty.write_all(&buf)?;
     tty.flush()?;
     Ok(())
+}
+
+fn write_hint_pair(buf: &mut Vec<u8>, key: &[u8], label: &[u8]) {
+    buf.extend_from_slice(" · ".as_bytes());
+    buf.extend_from_slice(SGR_NORMAL_WEIGHT);
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(SGR_DIM);
+    buf.push(b' ');
+    buf.extend_from_slice(label);
 }
 
 fn render_log_row(buf: &mut Vec<u8>, row: &Row, is_cursor: bool, is_selected: bool, width: usize) {
@@ -523,8 +587,9 @@ fn render_log_row(buf: &mut Vec<u8>, row: &Row, is_cursor: bool, is_selected: bo
     let used = visible_width(&truncated);
 
     if is_cursor {
-        buf.extend_from_slice(SGR_BG_CURSOR);
-        inject_bg_into(buf, &truncated, SGR_BG_CURSOR);
+        let bg = cursor_bg();
+        buf.extend_from_slice(bg);
+        inject_bg_into(buf, &truncated, bg);
         let pad = content_w.saturating_sub(used);
         for _ in 0..pad {
             buf.push(b' ');
