@@ -122,6 +122,76 @@ pub fn strip_ansi(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Run `jj show --summary` for a single revision and return the body
+/// (description + diff summary) with the metadata header stripped.
+pub fn show_summary(change_id: &str) -> Vec<u8> {
+    let out = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "show",
+            "--color=always",
+            "--summary",
+            "-r",
+            change_id,
+        ])
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => clip_description(&strip_show_header(&o.stdout), 3),
+        _ => b"(preview unavailable)".to_vec(),
+    }
+}
+
+/// `jj show` output starts with `Commit ID:` / `Change ID:` / `Author:` /
+/// `Committer:` lines, then a blank line, then the description, then file
+/// list. Skip everything up to and including the first blank line.
+fn strip_show_header(bytes: &[u8]) -> Vec<u8> {
+    if let Some(pos) = bytes.windows(2).position(|w| w == b"\n\n") {
+        bytes[pos + 2..].to_vec()
+    } else {
+        bytes.to_vec()
+    }
+}
+
+/// Truncate the (4-space-indented) description block to `max_desc` lines,
+/// appending a dim ellipsis to the last kept line if anything was clipped.
+/// Lines after the description (blank separator + `M`/`A`/`D` file list)
+/// pass through unchanged so the file summary remains visible.
+fn clip_description(bytes: &[u8], max_desc: usize) -> Vec<u8> {
+    let lines: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+    // Description lines are the leading lines that start with 4 spaces.
+    let mut desc_total = 0;
+    for line in &lines {
+        if line.starts_with(b"    ") {
+            desc_total += 1;
+        } else {
+            break;
+        }
+    }
+
+    let kept = desc_total.min(max_desc);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut first = true;
+    for line in lines.iter().take(kept) {
+        if !first {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(line);
+        first = false;
+    }
+    if desc_total > max_desc {
+        out.extend_from_slice(b" \x1b[2m\xe2\x80\xa6\x1b[0m");
+    }
+    for line in lines.iter().skip(desc_total) {
+        if !first {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(line);
+        first = false;
+    }
+    out
+}
+
 pub fn supports_revisions(subcommand: &str) -> Result<bool> {
     let output = Command::new("jj")
         .arg(subcommand)

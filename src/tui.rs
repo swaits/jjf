@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::time::Duration;
@@ -7,7 +7,10 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-use crate::jj::Row;
+use crate::jj::{self, Row};
+
+const PREVIEW_MIN_COLS: u16 = 80;
+const VIEWPORT_MIN: u16 = 15;
 
 // SGR constants
 const SGR_RESET: &[u8] = b"\x1b[0m";
@@ -31,6 +34,7 @@ struct App {
     filtered: Vec<usize>,
     matcher: Matcher,
     last_height: usize,
+    preview_cache: HashMap<usize, Vec<u8>>,
 }
 
 impl App {
@@ -45,7 +49,17 @@ impl App {
             filtered: (0..n).collect(),
             matcher: Matcher::new(Config::DEFAULT),
             last_height: 0,
+            preview_cache: HashMap::new(),
         }
+    }
+
+    fn preview_for(&mut self, row_idx: usize) -> &[u8] {
+        if !self.preview_cache.contains_key(&row_idx) {
+            let cid = self.rows[row_idx].change_id_short.clone();
+            let bytes = jj::show_summary(&cid);
+            self.preview_cache.insert(row_idx, bytes);
+        }
+        self.preview_cache.get(&row_idx).unwrap()
     }
 
     fn refilter(&mut self) {
@@ -202,9 +216,8 @@ pub fn run(rows: Vec<Row>) -> Result<Option<Vec<String>>> {
     let mut viewport_y: u16 = 0;
     let result = (|| {
         let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let max_height = (term_rows / 2).clamp(8, 20);
         let needed = (rows.len() as u16).saturating_add(2);
-        let viewport_height = needed.min(max_height).max(4);
+        let viewport_height = needed.max(VIEWPORT_MIN).min(term_rows.max(1));
 
         viewport_y = allocate_viewport(&mut tty, viewport_height, term_rows)?;
         tty.write_all(HIDE_CURSOR)?;
@@ -261,7 +274,7 @@ fn run_loop(
     let mut app = App::new(rows);
     app.last_height = (viewport_height as usize).saturating_sub(2); // input + hint
     loop {
-        render(tty, &app, viewport_y, viewport_height, term_cols)?;
+        render(tty, &mut app, viewport_y, viewport_height, term_cols)?;
         if !event::poll(Duration::from_millis(250)).context("event poll failed")? {
             continue;
         }
@@ -379,17 +392,37 @@ fn delete_word(s: &mut String) {
 
 fn render(
     tty: &mut File,
-    app: &App,
+    app: &mut App,
     viewport_y: u16,
     viewport_height: u16,
     term_cols: u16,
 ) -> Result<()> {
-    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let log_height = app.last_height;
 
-    // Move to viewport top-left.
+    let preview_enabled = term_cols >= PREVIEW_MIN_COLS;
+    let (left_w, right_x, right_w): (usize, u16, usize) = if preview_enabled {
+        let lw = (term_cols / 2).saturating_sub(1) as usize;
+        let rx = term_cols / 2 + 1;
+        let rw = (term_cols as usize).saturating_sub(rx as usize);
+        (lw, rx, rw)
+    } else {
+        (term_cols as usize, term_cols, 0)
+    };
+
+    // Pre-compute preview lines (cached) for the cursor row, before borrowing app immutably.
+    let preview_lines: Vec<Vec<u8>> = if preview_enabled {
+        if let Some(&row_idx) = app.filtered.get(app.cursor) {
+            split_lines(app.preview_for(row_idx))
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Input row (left only).
     write!(buf, "\x1b[{};1H", viewport_y + 1)?;
-
-    // Input row.
     buf.extend_from_slice(SGR_BOLD);
     buf.extend_from_slice(SGR_FG_CYAN);
     buf.extend_from_slice("❯ ".as_bytes());
@@ -399,10 +432,8 @@ fn render(
     buf.extend_from_slice("█".as_bytes());
     buf.extend_from_slice(SGR_RESET);
     buf.extend_from_slice(ERASE_TO_EOL);
-    buf.extend_from_slice(b"\r\n");
 
     // Log rows.
-    let log_height = app.last_height;
     let visible: Vec<(usize, usize)> = app
         .filtered
         .iter()
@@ -413,18 +444,34 @@ fn render(
         .collect();
 
     for i in 0..log_height {
+        let row_y = viewport_y + 2 + i as u16; // input row + offset
+        write!(buf, "\x1b[{};1H", row_y)?;
+        buf.extend_from_slice(ERASE_TO_EOL);
+
         if let Some(&(filt_idx, row_idx)) = visible.get(i) {
             let row = &app.rows[row_idx];
             let is_cursor = filt_idx == app.cursor;
             let is_selected = app.selected.contains(&row_idx);
-            render_row(&mut buf, row, is_cursor, is_selected, term_cols);
-        } else {
-            buf.extend_from_slice(ERASE_TO_EOL);
+            render_log_row(&mut buf, row, is_cursor, is_selected, left_w);
         }
-        buf.extend_from_slice(b"\r\n");
+
+        if preview_enabled {
+            write!(buf, "\x1b[{};{}H", row_y, right_x + 1)?;
+            buf.extend_from_slice(ERASE_TO_EOL);
+            buf.extend_from_slice(SGR_DIM);
+            buf.extend_from_slice("│ ".as_bytes());
+            buf.extend_from_slice(SGR_RESET);
+            if let Some(line) = preview_lines.get(i) {
+                let clipped = truncate_ansi(line, right_w.saturating_sub(2));
+                buf.extend_from_slice(&clipped);
+                buf.extend_from_slice(SGR_RESET);
+            }
+        }
     }
 
-    // Hint row.
+    // Hint row (left only).
+    let hint_y = viewport_y + 1 + log_height as u16 + 1;
+    write!(buf, "\x1b[{};1H", hint_y)?;
     let counts = if app.selected.is_empty() {
         format!("[{}/{}]  ", app.filtered.len(), app.rows.len())
     } else {
@@ -443,19 +490,26 @@ fn render(
     buf.extend_from_slice(SGR_RESET);
     buf.extend_from_slice(ERASE_TO_EOL);
 
-    // Park cursor at end of input line so terminal doesn't blink in the log.
-    // Compute input column = column after "❯ " + filter chars + cursor block.
+    if preview_enabled {
+        write!(buf, "\x1b[{};{}H", hint_y, right_x + 1)?;
+        buf.extend_from_slice(ERASE_TO_EOL);
+    }
+
+    // Park cursor at end of input line.
     let input_col = 2 + app.filter.chars().count() as u16 + 1;
     write!(buf, "\x1b[{};{}H", viewport_y + 1, input_col + 1)?;
 
-    let _ = viewport_height; // currently unused; reserved for future use
+    let _ = viewport_height;
     tty.write_all(&buf)?;
     tty.flush()?;
     Ok(())
 }
 
-fn render_row(buf: &mut Vec<u8>, row: &Row, is_cursor: bool, is_selected: bool, width: u16) {
-    // Selected marker (always rendered at column 0, two cells)
+fn render_log_row(buf: &mut Vec<u8>, row: &Row, is_cursor: bool, is_selected: bool, width: usize) {
+    let gutter_w = 2;
+    let content_w = width.saturating_sub(gutter_w);
+
+    // Gutter: yellow `▎ ` if selected, else two spaces.
     if is_selected {
         buf.extend_from_slice(SGR_BOLD);
         buf.extend_from_slice(SGR_FG_YELLOW);
@@ -465,24 +519,91 @@ fn render_row(buf: &mut Vec<u8>, row: &Row, is_cursor: bool, is_selected: bool, 
         buf.extend_from_slice(b"  ");
     }
 
+    let truncated = truncate_ansi(&row.styled, content_w);
+    let used = visible_width(&truncated);
+
     if is_cursor {
         buf.extend_from_slice(SGR_BG_CURSOR);
-        // Inject bg-restore after every embedded reset so the row's bg persists.
-        inject_bg_into(buf, &row.styled, SGR_BG_CURSOR);
-        // Pad to terminal width with bg.
-        let used_chars = 2 + crate::jj::strip_ansi(&row.styled).chars().count();
-        let width_us = width as usize;
-        if used_chars < width_us {
-            for _ in 0..(width_us - used_chars) {
-                buf.push(b' ');
-            }
+        inject_bg_into(buf, &truncated, SGR_BG_CURSOR);
+        let pad = content_w.saturating_sub(used);
+        for _ in 0..pad {
+            buf.push(b' ');
         }
         buf.extend_from_slice(SGR_RESET);
-        buf.extend_from_slice(ERASE_TO_EOL);
     } else {
-        buf.extend_from_slice(&row.styled);
+        buf.extend_from_slice(&truncated);
         buf.extend_from_slice(SGR_RESET);
-        buf.extend_from_slice(ERASE_TO_EOL);
+    }
+}
+
+fn split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    bytes.split(|&b| b == b'\n').map(|l| l.to_vec()).collect()
+}
+
+/// Count visible chars (post-CSI-strip) in a UTF-8 byte slice.
+fn visible_width(bytes: &[u8]) -> usize {
+    let mut w = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+            i += 2;
+            while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+        } else {
+            let lead = bytes[i];
+            let len = utf8_char_len(lead);
+            i = (i + len).min(bytes.len());
+            w += 1;
+        }
+    }
+    w
+}
+
+/// Truncate `bytes` so visible (non-CSI, non-continuation) chars fit in `max`.
+/// All CSI sequences are preserved; only printable chars are counted.
+fn truncate_ansi(bytes: &[u8], max: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut visible = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+            let start = i;
+            i += 2;
+            while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            out.extend_from_slice(&bytes[start..i]);
+        } else {
+            if visible >= max {
+                break;
+            }
+            let lead = bytes[i];
+            let len = utf8_char_len(lead);
+            let end = (i + len).min(bytes.len());
+            out.extend_from_slice(&bytes[i..end]);
+            visible += 1;
+            i = end;
+        }
+    }
+    out
+}
+
+fn utf8_char_len(lead: u8) -> usize {
+    if lead < 0x80 || (0x80..0xc0).contains(&lead) {
+        1
+    } else if lead < 0xe0 {
+        2
+    } else if lead < 0xf0 {
+        3
+    } else {
+        4
     }
 }
 
