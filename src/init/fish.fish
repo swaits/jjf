@@ -9,6 +9,10 @@ function jjf
         command jjf $argv
         return $status
     end
+    # Arm the postexec hook *before* invoking the picker so the original
+    # `jjf …` entry is removed from history on any exit path (cancel, error,
+    # or success). Fish records function invocations *after* return.
+    set -g _jjf_pending_swap 1
     set -l _jjf_cmd (command jjf --emit $argv)
     set -l _jjf_status $status
     if test $_jjf_status -ne 0
@@ -18,9 +22,6 @@ function jjf
         return 130
     end
     builtin history append -- $_jjf_cmd
-    # Signal the postexec hook to remove the literal `jjf …` entry that fish
-    # is about to record (fish records function invocations *after* return).
-    set -g _jjf_pending_swap 1
     sh -c $_jjf_cmd
 end
 
