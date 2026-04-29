@@ -1,9 +1,7 @@
 def --env jjf [...args] {
+    # No args → default to `show` so `jjf` alone is a rev browser.
+    let args = if ($args | is-empty) { ["show"] } else { $args }
     # Meta-commands and bare flags bypass the picker and run the binary directly.
-    if ($args | is-empty) {
-        ^jjf
-        return
-    }
     let first = $args.0
     if $first == "init" or ($first | str starts-with "-") {
         ^jjf ...$args

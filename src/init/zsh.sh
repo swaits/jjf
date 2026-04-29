@@ -1,6 +1,10 @@
 jjf() {
+    # No args → default to `show` so `jjf` alone is a rev browser.
+    if [ $# -eq 0 ]; then
+        set -- show
+    fi
     # Meta-commands and bare flags bypass the picker and run the binary directly.
-    if [ $# -eq 0 ] || [ "$1" = "init" ] || [ "${1#-}" != "$1" ]; then
+    if [ "$1" = "init" ] || [ "${1#-}" != "$1" ]; then
         command jjf "$@"
         return $?
     fi

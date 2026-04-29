@@ -1,10 +1,10 @@
 function jjf
     set -e _jjf_pending_swap
-    # Meta-commands and bare flags bypass the picker and run the binary directly.
+    # No args → default to `show` so `jjf` alone is a rev browser.
     if test (count $argv) -eq 0
-        command jjf
-        return $status
+        set argv show
     end
+    # Meta-commands and bare flags bypass the picker and run the binary directly.
     if test "$argv[1]" = init; or string match -q -- '-*' $argv[1]
         command jjf $argv
         return $status
