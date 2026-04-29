@@ -89,7 +89,7 @@ fn run_pick(subcommand: &str, passthrough: &[String], emit: bool) -> Result<u8> 
         None
     };
 
-    let tui_result = tui::run(rows);
+    let tui_result = tui::run(rows, subcommand, passthrough);
 
     if let Some(saved) = saved_stdout {
         restore_stdout(saved)?;

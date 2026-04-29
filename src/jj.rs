@@ -4,13 +4,23 @@ use anyhow::{Context, Result};
 
 const SEP: u8 = 0x1f;
 
+// Custom oneline template: drop the timestamp and commit id (rarely useful in
+// the picker, and the commit-id hex steals real estate), keep change-id with
+// shortest-unique-prefix highlighting, bookmarks, conflict/empty labels, and
+// the first line of the description.
 const TEMPLATE: &str = concat!(
     "\"\\x1f\" ++ ",
     "change_id.short() ++ \"\\x1f\" ++ ",
     "change_id.shortest().prefix() ++ \"\\x1f\" ++ ",
     "commit_id.short() ++ \"\\x1f\" ++ ",
     "commit_id.shortest().prefix() ++ \"\\x1f\" ++ ",
-    "builtin_log_oneline",
+    "(separate(\" \", \
+        format_short_change_id(self.change_id()), \
+        bookmarks, \
+        if(conflict, label(\"conflict\", \"conflict\")), \
+        if(empty, label(\"empty\", \"(empty)\")), \
+        description.first_line() \
+    ))",
 );
 
 pub struct Row {
@@ -122,9 +132,21 @@ pub fn strip_ansi(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Run `jj show --summary` for a single revision and return the body
-/// (description + diff summary) with the metadata header stripped.
-pub fn show_summary(change_id: &str) -> Vec<u8> {
+/// Description and file-summary parts of `jj show --summary`, returned
+/// separately so the renderer can fit them dynamically into the available
+/// vertical space.
+pub struct PreviewParts {
+    /// Description lines (still 4-space-indented as jj show emits them),
+    /// joined by `\n`. No trailing blank.
+    pub description: Vec<u8>,
+    /// File list (`M path`, `A path`, …) joined by `\n`. No leading blank.
+    pub files: Vec<u8>,
+}
+
+/// Run `jj show --summary` for a single revision and split the result into
+/// description and file-list parts (stripping the `Commit ID:` / `Change ID:`
+/// / `Author:` / `Committer:` header).
+pub fn show_summary(change_id: &str) -> PreviewParts {
     let out = Command::new("jj")
         .args([
             "--ignore-working-copy",
@@ -137,59 +159,76 @@ pub fn show_summary(change_id: &str) -> Vec<u8> {
         .stderr(Stdio::null())
         .output();
     match out {
-        Ok(o) if o.status.success() => clip_description(&strip_show_header(&o.stdout), 3),
-        _ => b"(preview unavailable)".to_vec(),
+        Ok(o) if o.status.success() => parse_show_summary(&o.stdout),
+        _ => PreviewParts {
+            description: b"(preview unavailable)".to_vec(),
+            files: Vec::new(),
+        },
     }
 }
 
-/// `jj show` output starts with `Commit ID:` / `Change ID:` / `Author:` /
-/// `Committer:` lines, then a blank line, then the description, then file
-/// list. Skip everything up to and including the first blank line.
-fn strip_show_header(bytes: &[u8]) -> Vec<u8> {
-    if let Some(pos) = bytes.windows(2).position(|w| w == b"\n\n") {
-        bytes[pos + 2..].to_vec()
+fn parse_show_summary(bytes: &[u8]) -> PreviewParts {
+    // Skip the metadata header — everything up to and including the first
+    // `\n\n` (blank line) is `Commit ID:` / `Change ID:` / `Author:` /
+    // `Committer:` and we don't want any of it.
+    let body: &[u8] = if let Some(pos) = bytes.windows(2).position(|w| w == b"\n\n") {
+        &bytes[pos + 2..]
     } else {
-        bytes.to_vec()
-    }
-}
+        bytes
+    };
 
-/// Truncate the (4-space-indented) description block to `max_desc` lines,
-/// appending a dim ellipsis to the last kept line if anything was clipped.
-/// Lines after the description (blank separator + `M`/`A`/`D` file list)
-/// pass through unchanged so the file summary remains visible.
-fn clip_description(bytes: &[u8], max_desc: usize) -> Vec<u8> {
-    let lines: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
-    // Description lines are the leading lines that start with 4 spaces.
-    let mut desc_total = 0;
-    for line in &lines {
-        if line.starts_with(b"    ") {
-            desc_total += 1;
+    let lines: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
+
+    // Description block: leading lines that are either 4-space-indented or
+    // blank. Stops at the first non-indented non-blank line, which is the
+    // first file entry (e.g. `M src/main.rs`).
+    let mut desc_end = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if line.is_empty() || line.starts_with(b"    ") {
+            desc_end = i + 1;
         } else {
             break;
         }
     }
+    // Trim trailing blank lines from the description block.
+    while desc_end > 0 && lines[desc_end - 1].is_empty() {
+        desc_end -= 1;
+    }
 
-    let kept = desc_total.min(max_desc);
-    let mut out = Vec::with_capacity(bytes.len());
+    // Skip the first description line — it's the title, already shown on
+    // the left-pane oneline as `description.first_line()`. Also skip any
+    // blank lines immediately after it so the body starts cleanly.
+    let mut desc_start = if desc_end > 0 { 1 } else { 0 };
+    while desc_start < desc_end && lines[desc_start].is_empty() {
+        desc_start += 1;
+    }
+
+    let mut description = Vec::new();
+    for (i, line) in lines[desc_start..desc_end].iter().enumerate() {
+        if i > 0 {
+            description.push(b'\n');
+        }
+        // jj show indents description lines with 4 spaces — strip them so
+        // the preview pane doesn't waste a 4-char left margin (and so our
+        // wrapper has the full width to wrap into).
+        let stripped: &[u8] = line.strip_prefix(b"    ").unwrap_or(line);
+        description.extend_from_slice(stripped);
+    }
+
+    let mut files = Vec::new();
     let mut first = true;
-    for line in lines.iter().take(kept) {
-        if !first {
-            out.push(b'\n');
+    for line in lines.iter().skip(desc_end) {
+        if line.is_empty() {
+            continue;
         }
-        out.extend_from_slice(line);
+        if !first {
+            files.push(b'\n');
+        }
+        files.extend_from_slice(line);
         first = false;
     }
-    if desc_total > max_desc {
-        out.extend_from_slice(b" \x1b[2m\xe2\x80\xa6\x1b[0m");
-    }
-    for line in lines.iter().skip(desc_total) {
-        if !first {
-            out.push(b'\n');
-        }
-        out.extend_from_slice(line);
-        first = false;
-    }
-    out
+
+    PreviewParts { description, files }
 }
 
 pub fn supports_revisions(subcommand: &str) -> Result<bool> {

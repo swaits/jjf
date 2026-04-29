@@ -1,0 +1,10 @@
+❯                                                               ┌──────────────────────────────────────────────────────────────
+  ○  tovs chore(release): prepare 0.1.0 for crates.io           │  Mirrors the original bash+fzf script's behavior — `jjf`
+  @  xnkx feat(ux): more refinements                            │  alone becomes
+  ○  ssnu feat(ux): batch UX improvements                       │  a quick rev browser. Implemented in shell wrappers (so the
+  ○  lyxo fix(history): drop jjf entry on cancel/error paths t  │  --emit
+  ○  tqvr feat: two-column layout with jj show preview pane     │  history-rewrite path still applies); the binary itself still
+  ○  yksz feat: default to 'show' subcommand when jjf is invok ├─► prints
+  ○  lsqz feat: broaden picker revset to all() to expose every  │  usage on bare invocation, for explicit invocations.
+  ○  nzwx feat: initial implementation of jjf                   │
+  ◆  zzzz (empty)                                               │  M src/init/bash.sh

@@ -8,10 +8,9 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-use crate::jj::{self, Row};
+use crate::jj::{self, PreviewParts, Row};
 
 const PREVIEW_MIN_COLS: u16 = 80;
-const VIEWPORT_MIN: u16 = 15;
 
 // SGR constants
 const SGR_RESET: &[u8] = b"\x1b[0m";
@@ -22,7 +21,6 @@ const SGR_BOLD: &[u8] = b"\x1b[1m";
 const SGR_FG_CYAN: &[u8] = b"\x1b[36m";
 const SGR_FG_YELLOW: &[u8] = b"\x1b[33m";
 const ERASE_TO_EOL: &[u8] = b"\x1b[K";
-const ERASE_TO_END: &[u8] = b"\x1b[J";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 
 // Synchronized output (DEC Mode 2026): Kitty / WezTerm / foot / recent iTerm
@@ -64,7 +62,7 @@ struct App {
     filtered: Vec<usize>,
     matcher: Matcher,
     last_height: usize,
-    preview_cache: HashMap<usize, Vec<u8>>,
+    preview_cache: HashMap<usize, PreviewParts>,
 }
 
 impl App {
@@ -83,11 +81,10 @@ impl App {
         }
     }
 
-    fn preview_for(&mut self, row_idx: usize) -> &[u8] {
+    fn preview_for(&mut self, row_idx: usize) -> &PreviewParts {
         if !self.preview_cache.contains_key(&row_idx) {
             let cid = self.rows[row_idx].change_id_short.clone();
-            let bytes = jj::show_summary(&cid);
-            self.preview_cache.insert(row_idx, bytes);
+            self.preview_cache.insert(row_idx, jj::show_summary(&cid));
         }
         self.preview_cache.get(&row_idx).unwrap()
     }
@@ -234,7 +231,11 @@ fn score_row(
     if hit { Some(best) } else { None }
 }
 
-pub fn run(rows: Vec<Row>) -> Result<Option<Vec<String>>> {
+pub fn run(
+    rows: Vec<Row>,
+    subcommand: &str,
+    passthrough: &[String],
+) -> Result<Option<Vec<String>>> {
     install_panic_hook();
     let mut tty = OpenOptions::new()
         .read(true)
@@ -242,44 +243,20 @@ pub fn run(rows: Vec<Row>) -> Result<Option<Vec<String>>> {
         .open("/dev/tty")
         .context("open /dev/tty")?;
     crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
+    // Full-screen alt-screen mode: saves the user's screen, gives us the
+    // whole terminal as a clean canvas, restores on exit. Resize behavior
+    // becomes trivial because we own the entire display.
+    tty.write_all(b"\x1b[?1049h").context("enter alt screen")?;
+    tty.write_all(HIDE_CURSOR).context("hide cursor")?;
+    tty.flush().ok();
 
-    let mut viewport_y: u16 = 0;
-    let result = (|| {
-        let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let needed = (rows.len() as u16).saturating_add(2);
-        let viewport_height = needed.max(VIEWPORT_MIN).min(term_rows.max(1));
+    let result = run_loop(&mut tty, rows, subcommand, passthrough);
 
-        viewport_y = allocate_viewport(&mut tty, viewport_height, term_rows)?;
-        tty.write_all(HIDE_CURSOR)?;
-        tty.flush()?;
-
-        run_loop(&mut tty, rows, viewport_y, viewport_height, term_cols)
-    })();
-
-    let _ = cleanup_at(&mut tty, viewport_y);
+    let _ = tty.write_all(SHOW_CURSOR);
+    let _ = tty.write_all(b"\x1b[?1049l");
+    let _ = tty.flush();
     let _ = crossterm::terminal::disable_raw_mode();
     result
-}
-
-fn allocate_viewport(tty: &mut File, viewport_height: u16, term_rows: u16) -> Result<u16> {
-    let (_, mut cursor_row) = crossterm::cursor::position().context("query cursor position")?;
-    let bottom_excl = cursor_row + viewport_height;
-    if bottom_excl > term_rows {
-        let scroll = bottom_excl - term_rows;
-        for _ in 0..scroll {
-            tty.write_all(b"\n")?;
-        }
-        tty.flush()?;
-        cursor_row = cursor_row.saturating_sub(scroll);
-    }
-    Ok(cursor_row)
-}
-
-fn cleanup_at(tty: &mut File, viewport_y: u16) -> std::io::Result<()> {
-    write!(tty, "\x1b[{};1H", viewport_y + 1)?;
-    tty.write_all(ERASE_TO_END)?;
-    tty.write_all(SHOW_CURSOR)?;
-    tty.flush()
 }
 
 fn install_panic_hook() {
@@ -288,6 +265,7 @@ fn install_panic_hook() {
         let _ = crossterm::terminal::disable_raw_mode();
         if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
             let _ = tty.write_all(SHOW_CURSOR);
+            let _ = tty.write_all(b"\x1b[?1049l");
             let _ = tty.flush();
         }
         original(info);
@@ -297,14 +275,16 @@ fn install_panic_hook() {
 fn run_loop(
     tty: &mut File,
     rows: Vec<Row>,
-    viewport_y: u16,
-    viewport_height: u16,
-    term_cols: u16,
+    subcommand: &str,
+    passthrough: &[String],
 ) -> Result<Option<Vec<String>>> {
     let mut app = App::new(rows);
-    app.last_height = (viewport_height as usize).saturating_sub(2); // input + hint
+    let (mut term_cols, mut term_rows) =
+        crossterm::terminal::size().unwrap_or((80, 24));
+    // Chrome rows: input(1) + cmd_preview(1) + hint(1) = 3.
+    app.last_height = (term_rows as usize).saturating_sub(3);
     loop {
-        render(tty, &mut app, viewport_y, viewport_height, term_cols)?;
+        render(tty, &mut app, term_rows, term_cols, subcommand, passthrough)?;
         if !event::poll(Duration::from_millis(250)).context("event poll failed")? {
             continue;
         }
@@ -314,8 +294,13 @@ fn run_loop(
                     return Ok(action);
                 }
             }
-            Event::Resize(_, _) => {
-                // Just redraw on next loop iteration; viewport stays the same.
+            Event::Resize(new_cols, new_rows) => {
+                // Alt-screen mode: trivial. Just update dims and redraw.
+                term_cols = new_cols;
+                term_rows = new_rows;
+                app.last_height = (term_rows as usize).saturating_sub(3);
+                let _ = write!(tty, "\x1b[2J");
+                let _ = tty.flush();
             }
             _ => {}
         }
@@ -423,45 +408,61 @@ fn delete_word(s: &mut String) {
 fn render(
     tty: &mut File,
     app: &mut App,
-    viewport_y: u16,
-    viewport_height: u16,
+    term_rows: u16,
     term_cols: u16,
+    subcommand: &str,
+    passthrough: &[String],
 ) -> Result<()> {
+    let viewport_y: u16 = 0;
+    let viewport_height = term_rows;
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     buf.extend_from_slice(SYNC_BEGIN);
     let log_height = app.last_height;
 
     let preview_enabled = term_cols >= PREVIEW_MIN_COLS;
+    // Layout (1-indexed columns), with a 2-col separator between picker and box:
+    //   cols 1..=left_w               picker pane (text + padding for non-cursor;
+    //                                 text only, no bg padding, for cursor)
+    //   cols left_w+1 .. left_w+2     2-col separator
+    //   col  left_w+3                 box left edge `│` (non-cursor)
+    //   cols left_w+4 .. left_w+5     2-col gutter inside box
+    //   cols left_w+6 .. term_cols    preview content
+    //
+    // On the cursor row the picker text is NOT padded; instead a dynamic
+    // arrow fills from the text end through the separator and peeks into
+    // the box by exactly one column:
+    //   col Y+1                       ` `   (one space after text)
+    //   col Y+2                       `├`   (arrow start)
+    //   cols Y+3 .. left_w+3          `─`   (variable-length body)
+    //   col left_w+4                  `►`   (peeks 1 col into the box)
+    //   col left_w+5                  ` `
+    //   col left_w+6                  preview content (aligned with non-cursor)
     let (left_w, right_x, right_w): (usize, u16, usize) = if preview_enabled {
-        let lw = (term_cols / 2).saturating_sub(1) as usize;
-        let rx = term_cols / 2 + 1;
-        let rw = (term_cols as usize).saturating_sub(rx as usize);
+        let lw = (term_cols / 2).saturating_sub(3) as usize;
+        let rx = (lw + 2) as u16; // col where `│` lives (1-indexed): lw+3 = rx+1
+        let rw = (term_cols as usize).saturating_sub(lw + 2);
         (lw, rx, rw)
     } else {
         (term_cols as usize, term_cols, 0)
     };
 
-    // Pre-compute preview lines (cached) for the cursor row, before borrowing app immutably.
-    // The first preview row is a dim header anchoring the pane to the cursor's change ID.
-    let (preview_header, preview_lines): (Option<Vec<u8>>, Vec<Vec<u8>>) = if preview_enabled {
+    // Preview pane layout: top border (`┌─────`) sits on the *input row*,
+    // not the first log row, so log rows align 1:1 with preview content
+    // rows. Each preview content row is `│  <line>` (3-char gutter) or
+    // `├─►<line>` on the cursor's row, drawing the eye from picker
+    // selection into preview content.
+    let preview_gutter_w = 3;
+    let preview_content_w = right_w.saturating_sub(preview_gutter_w);
+    let preview_rows = log_height; // top border is on input row, not log area
+    let preview_lines: Vec<Vec<u8>> = if preview_enabled {
         if let Some(&row_idx) = app.filtered.get(app.cursor) {
-            let cid = if app.rows[row_idx].change_id_prefix.is_empty() {
-                app.rows[row_idx].change_id_short.clone()
-            } else {
-                app.rows[row_idx].change_id_prefix.clone()
-            };
-            let label = format!("── {cid} ");
-            let dashes = right_w.saturating_sub(label.chars().count());
-            let header = format!(
-                "\x1b[2m{label}{}\x1b[0m",
-                "─".repeat(dashes)
-            );
-            (Some(header.into_bytes()), split_lines(app.preview_for(row_idx)))
+            let parts = app.preview_for(row_idx);
+            build_preview_lines(parts, preview_rows, preview_content_w)
         } else {
-            (None, Vec::new())
+            Vec::new()
         }
     } else {
-        (None, Vec::new())
+        Vec::new()
     };
 
     // Input row (left only).
@@ -475,6 +476,20 @@ fn render(
     // convention; survives any colorscheme without competing with the cyan ❯.
     buf.extend_from_slice(b"\x1b[7m \x1b[27m");
     buf.extend_from_slice(ERASE_TO_EOL);
+
+    // Top border for the preview pane — drawn at the input row's vertical
+    // position so the box "starts" alongside the search field. Lives at
+    // col left_w+3 (= right_x + 1), past the 2-col separator from the picker.
+    if preview_enabled {
+        write!(buf, "\x1b[{};{}H", viewport_y + 1, right_x + 1)?;
+        buf.extend_from_slice(ERASE_TO_EOL);
+        buf.extend_from_slice(SGR_DIM);
+        buf.extend_from_slice("┌".as_bytes());
+        for _ in 1..right_w {
+            buf.extend_from_slice("─".as_bytes());
+        }
+        buf.extend_from_slice(SGR_RESET);
+    }
 
     // Log rows.
     let visible: Vec<(usize, usize)> = app
@@ -491,35 +506,75 @@ fn render(
         write!(buf, "\x1b[{};1H", row_y)?;
         buf.extend_from_slice(ERASE_TO_EOL);
 
-        if let Some(&(filt_idx, row_idx)) = visible.get(i) {
+        let on_cursor = visible
+            .get(i)
+            .is_some_and(|&(filt_idx, _)| filt_idx == app.cursor);
+
+        let visible_used: usize = if let Some(&(filt_idx, row_idx)) = visible.get(i) {
             let row = &app.rows[row_idx];
             let is_cursor = filt_idx == app.cursor;
             let is_selected = app.selected.contains(&row_idx);
-            render_log_row(&mut buf, row, is_cursor, is_selected, left_w);
-        }
+            render_log_row(&mut buf, row, is_cursor, is_selected, left_w)
+        } else {
+            0
+        };
 
         if preview_enabled {
-            write!(buf, "\x1b[{};{}H", row_y, right_x + 1)?;
-            buf.extend_from_slice(ERASE_TO_EOL);
-            if i == 0 {
-                if let Some(h) = &preview_header {
-                    buf.extend_from_slice(h);
-                }
-            } else {
+            if on_cursor {
+                // Dynamic arrow inline, starting at col visible_used+1:
+                //   ` ` ├ ─×N ► ` `   then preview content at col left_w+6.
+                buf.push(b' ');
                 buf.extend_from_slice(SGR_DIM);
-                buf.extend_from_slice("│ ".as_bytes());
-                buf.extend_from_slice(SGR_RESET);
-                if let Some(line) = preview_lines.get(i - 1) {
-                    let clipped = truncate_ansi(line, right_w.saturating_sub(2));
-                    buf.extend_from_slice(&clipped);
-                    buf.extend_from_slice(SGR_RESET);
+                buf.extend_from_slice("├".as_bytes());
+                let dash_count = (left_w + 1).saturating_sub(visible_used);
+                for _ in 0..dash_count {
+                    buf.extend_from_slice("─".as_bytes());
                 }
+                buf.extend_from_slice(SGR_RESET);
+                buf.extend_from_slice(SGR_FG_CYAN);
+                buf.extend_from_slice("►".as_bytes());
+                buf.extend_from_slice(SGR_RESET);
+                buf.push(b' ');
+            } else {
+                // Position past the picker pane: 2-col sep, then `│  `, then content.
+                write!(buf, "\x1b[{};{}H", row_y, left_w as u16 + 1)?;
+                buf.push(b' ');
+                buf.push(b' ');
+                buf.extend_from_slice(SGR_DIM);
+                buf.extend_from_slice("│  ".as_bytes());
+                buf.extend_from_slice(SGR_RESET);
+            }
+            if let Some(line) = preview_lines.get(i) {
+                buf.extend_from_slice(line);
+                buf.extend_from_slice(SGR_RESET);
             }
         }
     }
 
-    // Hint row (left only).
-    let hint_y = viewport_y + 1 + log_height as u16 + 1;
+    // Command preview row — `▶ jj describe -m 'foo' -r 'vx'` in bright green.
+    // Tells the user exactly what Enter will run, with the resolved `-r '<id>'`
+    // updated live as the cursor moves or selections toggle.
+    let cmd_y = viewport_y + 1 + log_height as u16 + 1;
+    write!(buf, "\x1b[{};1H", cmd_y)?;
+    buf.extend_from_slice(ERASE_TO_EOL);
+    let cmd = jj::command_line(subcommand, passthrough, &app.pending_ids());
+    let cmd_max = (term_cols as usize).saturating_sub(2); // for "▶ "
+    let cmd_visible: String = if cmd.chars().count() <= cmd_max {
+        cmd
+    } else if cmd_max == 0 {
+        String::new()
+    } else {
+        let mut s: String = cmd.chars().take(cmd_max.saturating_sub(1)).collect();
+        s.push('…');
+        s
+    };
+    buf.extend_from_slice(b"\x1b[1;32m"); // bold green
+    buf.extend_from_slice("▶ ".as_bytes());
+    buf.extend_from_slice(cmd_visible.as_bytes());
+    buf.extend_from_slice(SGR_RESET);
+
+    // Hint row (full width, below cmd preview).
+    let hint_y = cmd_y + 1;
     write!(buf, "\x1b[{};1H", hint_y)?;
     let counts = if app.selected.is_empty() {
         format!("[{}/{}]  ", app.filtered.len(), app.rows.len())
@@ -531,8 +586,6 @@ fn render(
             app.selected.len()
         )
     };
-    // Two-tone hint: keys at normal weight, labels dim. Gives the eye an anchor
-    // to scan by without removing any information.
     buf.extend_from_slice(SGR_DIM);
     buf.extend_from_slice(counts.as_bytes());
     buf.extend_from_slice(b"type filter");
@@ -544,16 +597,12 @@ fn render(
     buf.extend_from_slice(SGR_RESET);
     buf.extend_from_slice(ERASE_TO_EOL);
 
-    if preview_enabled {
-        write!(buf, "\x1b[{};{}H", hint_y, right_x + 1)?;
-        buf.extend_from_slice(ERASE_TO_EOL);
-    }
-
     // Park cursor at end of input line.
     let input_col = 2 + app.filter.chars().count() as u16 + 1;
     write!(buf, "\x1b[{};{}H", viewport_y + 1, input_col + 1)?;
 
     let _ = viewport_height;
+    let _ = right_x;
     buf.extend_from_slice(SYNC_END);
     tty.write_all(&buf)?;
     tty.flush()?;
@@ -569,7 +618,145 @@ fn write_hint_pair(buf: &mut Vec<u8>, key: &[u8], label: &[u8]) {
     buf.extend_from_slice(label);
 }
 
-fn render_log_row(buf: &mut Vec<u8>, row: &Row, is_cursor: bool, is_selected: bool, width: usize) {
+/// Pack description + files into `available_rows`. The file list always wins —
+/// description is clipped (with a dim ellipsis appended to its last kept line)
+/// to whatever room is left after the files (and a blank separator) are placed.
+/// Long description/file lines are word-wrapped to `width` columns.
+fn build_preview_lines(parts: &PreviewParts, available_rows: usize, width: usize) -> Vec<Vec<u8>> {
+    let mut desc_lines: Vec<Vec<u8>> = Vec::new();
+    if !parts.description.is_empty() {
+        for line in split_lines(&parts.description) {
+            desc_lines.extend(wrap_ansi(&line, width));
+        }
+    }
+    let mut file_lines: Vec<Vec<u8>> = Vec::new();
+    if !parts.files.is_empty() {
+        for line in split_lines(&parts.files) {
+            file_lines.extend(wrap_ansi(&line, width));
+        }
+    }
+
+    let blank_sep = if !desc_lines.is_empty() && !file_lines.is_empty() {
+        1
+    } else {
+        0
+    };
+    let max_desc = available_rows.saturating_sub(file_lines.len() + blank_sep);
+    let kept_desc = desc_lines.len().min(max_desc);
+    let clipped = desc_lines.len() > kept_desc;
+
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(kept_desc + blank_sep + file_lines.len());
+    for (i, line) in desc_lines.iter().take(kept_desc).enumerate() {
+        if clipped && i + 1 == kept_desc {
+            let mut last = line.clone();
+            last.extend_from_slice(b" \x1b[2m\xe2\x80\xa6\x1b[0m");
+            out.push(last);
+        } else {
+            out.push(line.clone());
+        }
+    }
+    if blank_sep == 1 && kept_desc > 0 {
+        out.push(Vec::new());
+    }
+    for line in file_lines {
+        out.push(line);
+    }
+    out
+}
+
+/// Word-wrap a line containing ANSI escapes to `width` visible columns.
+/// Splits on spaces; a word longer than `width` overflows on its own line
+/// rather than mid-word breaking. ANSI escape sequences carry through and
+/// don't count toward visible width.
+fn wrap_ansi(line: &[u8], width: usize) -> Vec<Vec<u8>> {
+    if width == 0 || visible_width(line) <= width {
+        return vec![line.to_vec()];
+    }
+
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut current_visible = 0usize;
+    let mut word: Vec<u8> = Vec::new();
+    let mut word_visible = 0usize;
+
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] == 0x1b && line.get(i + 1) == Some(&b'[') {
+            let start = i;
+            i += 2;
+            while i < line.len() && !line[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if i < line.len() {
+                i += 1;
+            }
+            // Append ANSI to the in-progress word so styling travels with it.
+            word.extend_from_slice(&line[start..i]);
+        } else if line[i] == b' ' {
+            // End-of-word: try to fit `word` into `current`.
+            let sep = if current_visible > 0 { 1 } else { 0 };
+            if current_visible + sep + word_visible <= width {
+                if sep == 1 {
+                    current.push(b' ');
+                    current_visible += 1;
+                }
+                current.extend_from_slice(&word);
+                current_visible += word_visible;
+            } else {
+                // Doesn't fit: flush current, start new line with the word.
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+                current.extend_from_slice(&word);
+                current_visible = word_visible;
+            }
+            word.clear();
+            word_visible = 0;
+            i += 1;
+        } else {
+            let lead = line[i];
+            let len = utf8_char_len(lead);
+            let end = (i + len).min(line.len());
+            word.extend_from_slice(&line[i..end]);
+            word_visible += 1;
+            i = end;
+        }
+    }
+    // Final word
+    if word_visible > 0 {
+        let sep = if current_visible > 0 { 1 } else { 0 };
+        if current_visible + sep + word_visible <= width {
+            if sep == 1 {
+                current.push(b' ');
+            }
+            current.extend_from_slice(&word);
+        } else {
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            current.extend_from_slice(&word);
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Render the picker portion of one log row. Returns the 1-indexed column
+/// after the rendered content (i.e. the col where the arrow's leading space
+/// would be drawn for the cursor row).
+///
+/// Non-cursor rows are padded with normal spaces to fill `width`. Cursor rows
+/// have bg highlight on actual text only and are NOT padded — the dynamic
+/// arrow fills the rest.
+fn render_log_row(
+    buf: &mut Vec<u8>,
+    row: &Row,
+    is_cursor: bool,
+    is_selected: bool,
+    width: usize,
+) -> usize {
     let gutter_w = 2;
     let content_w = width.saturating_sub(gutter_w);
 
@@ -590,14 +777,16 @@ fn render_log_row(buf: &mut Vec<u8>, row: &Row, is_cursor: bool, is_selected: bo
         let bg = cursor_bg();
         buf.extend_from_slice(bg);
         inject_bg_into(buf, &truncated, bg);
+        buf.extend_from_slice(SGR_RESET);
+        gutter_w + used
+    } else {
+        buf.extend_from_slice(&truncated);
+        buf.extend_from_slice(SGR_RESET);
         let pad = content_w.saturating_sub(used);
         for _ in 0..pad {
             buf.push(b' ');
         }
-        buf.extend_from_slice(SGR_RESET);
-    } else {
-        buf.extend_from_slice(&truncated);
-        buf.extend_from_slice(SGR_RESET);
+        width
     }
 }
 
