@@ -1,0 +1,14 @@
+[package]
+name = "jjf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29"
+nucleo-matcher = "0.3"
+anyhow = "1"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true
