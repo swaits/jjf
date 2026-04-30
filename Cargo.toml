@@ -2,6 +2,20 @@
 name = "jjf"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["Stephen Waits <steve@waits.net>"]
+description = "Fuzzy revision picker for jujutsu (jj). Wraps any jj subcommand with an interactive picker over jj log, with a live jj show preview pane."
+license = "MIT"
+repository = "https://github.com/swaits/jjf"
+homepage = "https://github.com/swaits/jjf"
+documentation = "https://docs.rs/jjf"
+readme = "README.md"
+keywords = ["jj", "jujutsu", "vcs", "picker", "fuzzy-finder"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    "/.github/",
+    "/ux.txt",
+]
 
 [dependencies]
 crossterm = "0.29"

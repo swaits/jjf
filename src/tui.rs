@@ -279,8 +279,7 @@ fn run_loop(
     passthrough: &[String],
 ) -> Result<Option<Vec<String>>> {
     let mut app = App::new(rows);
-    let (mut term_cols, mut term_rows) =
-        crossterm::terminal::size().unwrap_or((80, 24));
+    let (mut term_cols, mut term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     // Chrome rows: input(1) + cmd_preview(1) + hint(1) = 3.
     app.last_height = (term_rows as usize).saturating_sub(3);
     loop {
