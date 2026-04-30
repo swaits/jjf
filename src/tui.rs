@@ -68,7 +68,7 @@ struct App {
 impl App {
     fn new(rows: Vec<Row>) -> Self {
         let n = rows.len();
-        Self {
+        let mut app = Self {
             rows,
             filter: String::new(),
             cursor: 0,
@@ -78,7 +78,39 @@ impl App {
             matcher: Matcher::new(Config::DEFAULT),
             last_height: 0,
             preview_cache: HashMap::new(),
+        };
+        // Land the initial cursor on the first commit (connectors are
+        // unselectable, so a commit log starting with a `~` placeholder
+        // shouldn't park the cursor on it).
+        app.cursor = app.next_selectable(0, 1).unwrap_or(0);
+        app
+    }
+
+    /// Returns whether row `i` (in `self.rows`) is a connector / decorative
+    /// graph row that the cursor should skip over.
+    fn row_is_connector(&self, row_idx: usize) -> bool {
+        self.rows
+            .get(row_idx)
+            .is_some_and(|r| r.is_connector())
+    }
+
+    /// Find the nearest selectable position in `self.filtered` starting at
+    /// `from`, scanning by `step` (`1` = down, `-1` = up). Returns `None` if
+    /// every entry in the search direction is a connector.
+    fn next_selectable(&self, from: usize, step: isize) -> Option<usize> {
+        let len = self.filtered.len();
+        if len == 0 {
+            return None;
         }
+        let mut idx = from as isize;
+        while (0..len as isize).contains(&idx) {
+            let row_idx = self.filtered[idx as usize];
+            if !self.row_is_connector(row_idx) {
+                return Some(idx as usize);
+            }
+            idx += step;
+        }
+        None
     }
 
     fn preview_for(&mut self, row_idx: usize) -> &PreviewParts {
@@ -91,8 +123,13 @@ impl App {
 
     fn refilter(&mut self) {
         if self.filter.is_empty() {
+            // Empty query: show every row including connectors so the user
+            // sees the full graph chrome.
             self.filtered = (0..self.rows.len()).collect();
         } else {
+            // Non-empty query: only commits can match. Connectors carry no
+            // searchable content, so dropping them here also keeps the
+            // result list compact and free of orphaned graph fragments.
             let App {
                 rows,
                 matcher,
@@ -105,6 +142,7 @@ impl App {
             let mut scored: Vec<(usize, u32)> = rows
                 .iter()
                 .enumerate()
+                .filter(|(_, row)| !row.is_connector())
                 .filter_map(|(i, row)| {
                     score_row(row, filter, &q_lower, matcher, &mut hbuf, &mut nbuf).map(|s| (i, s))
                 })
@@ -112,7 +150,7 @@ impl App {
             scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             self.filtered = scored.into_iter().map(|(i, _)| i).collect();
         }
-        self.cursor = 0;
+        self.cursor = self.next_selectable(0, 1).unwrap_or(0);
         self.view_offset = 0;
     }
 
@@ -121,28 +159,34 @@ impl App {
         if len == 0 {
             return;
         }
-        let mut c = self.cursor as isize + delta;
-        if c < 0 {
-            c = 0;
-        }
         let max = len as isize - 1;
-        if c > max {
-            c = max;
+        let target_pos = (self.cursor as isize + delta).clamp(0, max) as usize;
+        // Scan past connector rows in the direction of motion. If we hit a
+        // wall (e.g. PageDown near the end with only connectors below), fall
+        // back to scanning the opposite direction so we always land on a
+        // commit.
+        let primary_step: isize = if delta >= 0 { 1 } else { -1 };
+        if let Some(t) = self
+            .next_selectable(target_pos, primary_step)
+            .or_else(|| self.next_selectable(target_pos, -primary_step))
+        {
+            self.cursor = t;
+            self.adjust_view();
         }
-        self.cursor = c as usize;
-        self.adjust_view();
     }
 
     fn jump_top(&mut self) {
-        self.cursor = 0;
+        self.cursor = self.next_selectable(0, 1).unwrap_or(0);
         self.adjust_view();
     }
 
     fn jump_bottom(&mut self) {
-        if !self.filtered.is_empty() {
-            self.cursor = self.filtered.len() - 1;
-            self.adjust_view();
+        if self.filtered.is_empty() {
+            return;
         }
+        let last = self.filtered.len() - 1;
+        self.cursor = self.next_selectable(last, -1).unwrap_or(last);
+        self.adjust_view();
     }
 
     fn adjust_view(&mut self) {
@@ -158,6 +202,7 @@ impl App {
 
     fn toggle_select(&mut self) {
         if let Some(&row_idx) = self.filtered.get(self.cursor)
+            && !self.row_is_connector(row_idx)
             && !self.selected.insert(row_idx)
         {
             self.selected.remove(&row_idx);
@@ -431,9 +476,9 @@ fn render(
     // arrow fills from the text end through the separator and peeks into
     // the box by exactly one column:
     //   col Y+1                       ` `   (one space after text)
-    //   col Y+2                       `├`   (arrow start)
+    //   col Y+2                       `●`   (arrow start)
     //   cols Y+3 .. left_w+3          `─`   (variable-length body)
-    //   col left_w+4                  `►`   (peeks 1 col into the box)
+    //   col left_w+4                  `▶`   (peeks 1 col into the box)
     //   col left_w+5                  ` `
     //   col left_w+6                  preview content (aligned with non-cursor)
     let (left_w, right_x, right_w): (usize, u16, usize) = if preview_enabled {
@@ -448,7 +493,7 @@ fn render(
     // Preview pane layout: top border (`┌─────`) sits on the *input row*,
     // not the first log row, so log rows align 1:1 with preview content
     // rows. Each preview content row is `│  <line>` (3-char gutter) or
-    // `├─►<line>` on the cursor's row, drawing the eye from picker
+    // `●─▶<line>` on the cursor's row, drawing the eye from picker
     // selection into preview content.
     let preview_gutter_w = 3;
     let preview_content_w = right_w.saturating_sub(preview_gutter_w);
@@ -521,17 +566,17 @@ fn render(
         if preview_enabled {
             if on_cursor {
                 // Dynamic arrow inline, starting at col visible_used+1:
-                //   ` ` ├ ─×N ► ` `   then preview content at col left_w+6.
+                //   ` ` ● ─×N ▶ ` `   then preview content at col left_w+6.
                 buf.push(b' ');
                 buf.extend_from_slice(SGR_DIM);
-                buf.extend_from_slice("├".as_bytes());
+                buf.extend_from_slice("●".as_bytes());
                 let dash_count = (left_w + 1).saturating_sub(visible_used);
                 for _ in 0..dash_count {
                     buf.extend_from_slice("─".as_bytes());
                 }
                 buf.extend_from_slice(SGR_RESET);
                 buf.extend_from_slice(SGR_FG_CYAN);
-                buf.extend_from_slice("►".as_bytes());
+                buf.extend_from_slice("▶".as_bytes());
                 buf.extend_from_slice(SGR_RESET);
                 buf.push(b' ');
             } else {
@@ -572,7 +617,9 @@ fn render(
     buf.extend_from_slice(cmd_visible.as_bytes());
     buf.extend_from_slice(SGR_RESET);
 
-    // Hint row (full width, below cmd preview).
+    // Hint row — must fit on a single line. If it wrapped, the wrapped
+    // tail would push the input row off the top of the terminal. So drop
+    // pairs from the right until the row fits in `term_cols`.
     let hint_y = cmd_y + 1;
     write!(buf, "\x1b[{};1H", hint_y)?;
     let counts = if app.selected.is_empty() {
@@ -585,14 +632,32 @@ fn render(
             app.selected.len()
         )
     };
+    let pairs: &[(&str, &str)] = &[
+        ("↑↓/^N^P", "nav"),
+        ("tab", "select"),
+        ("enter", "run"),
+        ("^U", "clear"),
+        ("esc", "quit"),
+    ];
+    let base_w = counts.chars().count() + "type filter".chars().count();
+    let max_w = term_cols as usize;
+    let mut used = base_w;
+    let mut keep = 0usize;
+    for (key, label) in pairs {
+        // " · " (3) + key + " " (1) + label
+        let w = 3 + key.chars().count() + 1 + label.chars().count();
+        if used + w > max_w {
+            break;
+        }
+        used += w;
+        keep += 1;
+    }
     buf.extend_from_slice(SGR_DIM);
     buf.extend_from_slice(counts.as_bytes());
     buf.extend_from_slice(b"type filter");
-    write_hint_pair(&mut buf, "↑↓/^N^P".as_bytes(), b"nav");
-    write_hint_pair(&mut buf, b"tab", b"select");
-    write_hint_pair(&mut buf, b"enter", b"run");
-    write_hint_pair(&mut buf, b"^U", b"clear");
-    write_hint_pair(&mut buf, b"esc", b"quit");
+    for (key, label) in pairs.iter().take(keep) {
+        write_hint_pair(&mut buf, key.as_bytes(), label.as_bytes());
+    }
     buf.extend_from_slice(SGR_RESET);
     buf.extend_from_slice(ERASE_TO_EOL);
 

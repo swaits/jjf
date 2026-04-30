@@ -4,10 +4,24 @@ use anyhow::{Context, Result};
 
 const SEP: u8 = 0x1f;
 
-// Custom oneline template: drop the timestamp and commit id (rarely useful in
-// the picker, and the commit-id hex steals real estate), keep change-id with
-// shortest-unique-prefix highlighting, bookmarks, conflict/empty labels, and
-// the first line of the description.
+// Custom oneline template emitting field-separated values. We run jj with
+// its native `--graph` so the merge connectors (`├─┬─╮`, `╰─╯`) render
+// exactly as they do in `jj log` — the picker treats those connector-only
+// rows as decoration and keeps the cursor on commit rows.
+//
+// The template MUST emit a single line per commit (no embedded `\n`,
+// `ui.log-word-wrap=false`), or jj's graph drawer would inject continuation
+// rows into our one-line invariant.
+//
+// Fields (\x1f-separated, leading `\x1f` separates jj's graph chrome from
+// our fields):
+//   0  graph chrome (everything jj prepended before the first \x1f)
+//   1  change_id.short()                 — full 12-char change id
+//   2  change_id.shortest().prefix()     — shortest unique prefix
+//   3  commit_id.short()                 — full 12-char commit id
+//   4  commit_id.shortest().prefix()     — shortest unique prefix
+//   5  payload — change-id-prefix-highlighted, bookmarks, conflict/empty,
+//                description.first_line()
 const TEMPLATE: &str = concat!(
     "\"\\x1f\" ++ ",
     "change_id.short() ++ \"\\x1f\" ++ ",
@@ -23,6 +37,8 @@ const TEMPLATE: &str = concat!(
     ))",
 );
 
+/// Either a commit row (selectable) or a connector row (decoration only —
+/// `├─┬─╮`, `│ │`, `~`, …). Connectors have empty `change_id_short`.
 pub struct Row {
     pub change_id_short: String,
     pub change_id_prefix: String,
@@ -32,10 +48,22 @@ pub struct Row {
     pub styled: Vec<u8>,
 }
 
+impl Row {
+    pub fn is_connector(&self) -> bool {
+        self.change_id_short.is_empty()
+    }
+}
+
 pub fn capture_log() -> Result<Vec<Row>> {
     let output = Command::new("jj")
         .args([
             "--ignore-working-copy",
+            // Force off any user `ui.log-word-wrap = true` — wrapping would
+            // split a description into a continuation row that looks
+            // syntactically identical to a graph connector row, breaking the
+            // one-row-per-commit invariant the picker relies on.
+            "--config",
+            "ui.log-word-wrap=false",
             "log",
             "--color=always",
             "-r",
@@ -58,14 +86,15 @@ pub fn capture_log() -> Result<Vec<Row>> {
         if raw.is_empty() {
             continue;
         }
-        if let Some(row) = parse_row(raw) {
-            rows.push(row);
-        }
+        rows.push(parse_row(raw));
     }
     Ok(rows)
 }
 
-fn parse_row(bytes: &[u8]) -> Option<Row> {
+/// Parse one line of `jj log --graph` output. A line with our 5 `\x1f`
+/// separators is a commit row; anything else is a connector / `~` /
+/// continuation row that we keep as decoration but render unselectable.
+fn parse_row(bytes: &[u8]) -> Row {
     let mut parts: Vec<&[u8]> = Vec::with_capacity(6);
     let mut start = 0;
     for (i, &b) in bytes.iter().enumerate() {
@@ -78,7 +107,17 @@ fn parse_row(bytes: &[u8]) -> Option<Row> {
         }
     }
     if parts.len() < 5 {
-        return None;
+        // Connector / `~` / pure-graph row — keep as decoration only.
+        let styled = bytes.to_vec();
+        let plain = strip_ansi(&styled);
+        return Row {
+            change_id_short: String::new(),
+            change_id_prefix: String::new(),
+            commit_id_short: String::new(),
+            commit_id_prefix: String::new(),
+            plain,
+            styled,
+        };
     }
     parts.push(&bytes[start..]);
 
@@ -89,24 +128,19 @@ fn parse_row(bytes: &[u8]) -> Option<Row> {
     let commit_id_prefix = strip_ansi(parts[4]);
     let payload = parts[5];
 
-    if change_id_short.is_empty() {
-        return None;
-    }
-
     let mut styled = Vec::with_capacity(graph.len() + payload.len());
     styled.extend_from_slice(graph);
     styled.extend_from_slice(payload);
-
     let plain = strip_ansi(&styled);
 
-    Some(Row {
+    Row {
         change_id_short,
         change_id_prefix,
         commit_id_short,
         commit_id_prefix,
         plain,
         styled,
-    })
+    }
 }
 
 /// Strip CSI escape sequences (ESC `[` … letter) from a byte slice.

@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-04-29
+
+Picker now renders jj's real graph (merge connectors and all), with the
+cursor/filter aware of decorative rows.
+
+### Changed
+
+- Graph rendering now uses jj's native `--graph` output instead of a
+  custom one-row-per-commit reconstruction. Merge connectors
+  (`├─┬─╮`, `├─╯`, `╰─╯`) appear exactly as `jj log` draws them, so the
+  picker is a 1:1 visual match for the real log.
+- Cursor row arrow glyphs changed from `├──►` to `●──▶` so the
+  selection arrow doesn't visually clash with the graph chrome.
+- Hint row at the bottom of the picker drops trailing key/label pairs
+  (`esc quit`, `^U clear`, …) until it fits on one row. Previously a
+  narrow terminal would wrap the hint and push the search bar off the
+  top of the screen.
+
+### Added
+
+- Connector / decorative graph rows (`├─╮`, `╰─╯`, `~`, …) are kept in
+  the picker for visual fidelity with `jj log`. Cursor navigation
+  (arrows, Page{Up,Down}, Home, End, Ctrl-N/P/J/K, Ctrl-A/E) skips over
+  them; selection is silently ignored on connector rows.
+- Filtering (any non-empty query) excludes connector rows, since they
+  can't match a query and a stray `├─╮` between filtered hits would
+  carry no useful information.
+
+### Fixed
+
+- Long descriptions no longer split across rows when the user has
+  `ui.log-word-wrap = true` configured globally — the internal
+  `jj log` invocation now forces `ui.log-word-wrap=false` so a single
+  commit always renders on a single picker row.
+
+[0.2.0]: https://github.com/swaits/jjf/releases/tag/v0.2.0
+
 ## [0.1.0] — 2026-04-29
 
 Initial release.

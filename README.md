@@ -12,7 +12,7 @@ command that's about to run.
 ❯ vx                                          ┌────────────────────────────────
   ○  tovs chore(release): prepare 0.1.0       │  - Add LICENSE (MIT)
   @  xnkx feat(ux): more refinements          │  - Add README with install,
-  ○  ssnu feat(ux): batch UX improvements ├──►│   usage, keybindings…
+  ○  ssnu feat(ux): batch UX improvements ●──▶│   usage, keybindings…
   ○  lyxo fix(history): drop jjf entry        │
   ○  tqvr feat: two-column layout             │  M  Cargo.toml
   ○  yksz feat: default to 'show'             │  A  LICENSE
