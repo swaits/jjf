@@ -25,19 +25,19 @@ fn real_main() -> Result<u8> {
 
     match first.as_str() {
         "init" => run_init(args),
-        "--emit" => match args.next() {
-            Some(sub) => {
-                let passthrough: Vec<String> = args.collect();
-                run_pick(&sub, &passthrough, /* emit = */ true)
-            }
-            None => {
+        "--emit" => {
+            let rest: Vec<String> = args.collect();
+            if rest.is_empty() {
                 eprintln!("usage: jjf --emit <jj-subcommand> [args...]");
-                Ok(2)
+                return Ok(2);
             }
-        },
-        sub => {
-            let passthrough: Vec<String> = args.collect();
-            run_pick(sub, &passthrough, /* emit = */ false)
+            run_pick(&rest, /* emit = */ true)
+        }
+        _ => {
+            let mut all = Vec::with_capacity(1 + args.size_hint().0);
+            all.push(first);
+            all.extend(args);
+            run_pick(&all, /* emit = */ false)
         }
     }
 }
@@ -65,10 +65,29 @@ fn run_init(mut args: impl Iterator<Item = String>) -> Result<u8> {
     }
 }
 
-fn run_pick(subcommand: &str, passthrough: &[String], emit: bool) -> Result<u8> {
-    if !jj::supports_revisions(subcommand)? {
+fn run_pick(args: &[String], emit: bool) -> Result<u8> {
+    let target = jj::resolve_target(args)?;
+
+    // Case 1: user already supplied a revset flag — bypass the picker entirely
+    // and run their command verbatim. Avoids double-`-r` and respects what
+    // they explicitly asked for.
+    if has_user_revset_flag(&target.passthrough) {
+        if emit {
+            let cmd = jj::command_line(&target, &[]);
+            println!("{cmd}");
+            return Ok(0);
+        }
+        echo_command(&target, &[]);
+        let status = jj::exec(&target, &[])?;
+        return Ok(status.code().unwrap_or(1) as u8);
+    }
+
+    // Case 2: leaf accepts no revset flag at all (e.g. `jj operation`,
+    // `jj workspace list`). Refuse to run the picker.
+    if target.flag.is_none() {
+        let leaf = target.leaf.join(" ");
         eprintln!(
-            "jjf: 'jj {subcommand}' doesn't take revisions — run 'jj {subcommand}' directly."
+            "jjf: 'jj {leaf}' takes no revset flag (-r/--to) — run 'jj {leaf}' directly."
         );
         return Ok(2);
     }
@@ -89,7 +108,7 @@ fn run_pick(subcommand: &str, passthrough: &[String], emit: bool) -> Result<u8> 
         None
     };
 
-    let tui_result = tui::run(rows, subcommand, passthrough);
+    let tui_result = tui::run(rows, &target);
 
     if let Some(saved) = saved_stdout {
         restore_stdout(saved)?;
@@ -103,14 +122,23 @@ fn run_pick(subcommand: &str, passthrough: &[String], emit: bool) -> Result<u8> 
     }
 
     if emit {
-        let cmd = jj::command_line(subcommand, passthrough, &ids);
+        let cmd = jj::command_line(&target, &ids);
         println!("{cmd}");
         Ok(0)
     } else {
-        echo_command(subcommand, passthrough, &ids);
-        let status = jj::exec(subcommand, passthrough, &ids)?;
+        echo_command(&target, &ids);
+        let status = jj::exec(&target, &ids)?;
         Ok(status.code().unwrap_or(1) as u8)
     }
+}
+
+fn has_user_revset_flag(passthrough: &[String]) -> bool {
+    passthrough.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "-r" | "--revision" | "--revisions" | "-t" | "--to"
+        )
+    })
 }
 
 #[cfg(unix)]
@@ -142,9 +170,9 @@ fn restore_stdout(saved: libc::c_int) -> Result<()> {
     Ok(())
 }
 
-fn echo_command(subcommand: &str, passthrough: &[String], ids: &[String]) {
+fn echo_command(target: &jj::RevsetTarget, ids: &[String]) {
     use std::io::IsTerminal;
-    let cmd = jj::command_line(subcommand, passthrough, ids);
+    let cmd = jj::command_line(target, ids);
     if std::io::stdout().is_terminal() {
         println!("\x1b[2m$\x1b[0m {cmd}");
     } else {

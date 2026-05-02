@@ -278,8 +278,7 @@ fn score_row(
 
 pub fn run(
     rows: Vec<Row>,
-    subcommand: &str,
-    passthrough: &[String],
+    target: &jj::RevsetTarget,
 ) -> Result<Option<Vec<String>>> {
     install_panic_hook();
     let mut tty = OpenOptions::new()
@@ -295,7 +294,7 @@ pub fn run(
     tty.write_all(HIDE_CURSOR).context("hide cursor")?;
     tty.flush().ok();
 
-    let result = run_loop(&mut tty, rows, subcommand, passthrough);
+    let result = run_loop(&mut tty, rows, target);
 
     let _ = tty.write_all(SHOW_CURSOR);
     let _ = tty.write_all(b"\x1b[?1049l");
@@ -320,15 +319,14 @@ fn install_panic_hook() {
 fn run_loop(
     tty: &mut File,
     rows: Vec<Row>,
-    subcommand: &str,
-    passthrough: &[String],
+    target: &jj::RevsetTarget,
 ) -> Result<Option<Vec<String>>> {
     let mut app = App::new(rows);
     let (mut term_cols, mut term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     // Chrome rows: input(1) + cmd_preview(1) + hint(1) = 3.
     app.last_height = (term_rows as usize).saturating_sub(3);
     loop {
-        render(tty, &mut app, term_rows, term_cols, subcommand, passthrough)?;
+        render(tty, &mut app, term_rows, term_cols, target)?;
         if !event::poll(Duration::from_millis(250)).context("event poll failed")? {
             continue;
         }
@@ -454,8 +452,7 @@ fn render(
     app: &mut App,
     term_rows: u16,
     term_cols: u16,
-    subcommand: &str,
-    passthrough: &[String],
+    target: &jj::RevsetTarget,
 ) -> Result<()> {
     let viewport_y: u16 = 0;
     let viewport_height = term_rows;
@@ -601,7 +598,7 @@ fn render(
     let cmd_y = viewport_y + 1 + log_height as u16 + 1;
     write!(buf, "\x1b[{};1H", cmd_y)?;
     buf.extend_from_slice(ERASE_TO_EOL);
-    let cmd = jj::command_line(subcommand, passthrough, &app.pending_ids());
+    let cmd = jj::command_line(target, &app.pending_ids());
     let cmd_max = (term_cols as usize).saturating_sub(2); // for "▶ "
     let cmd_visible: String = if cmd.chars().count() <= cmd_max {
         cmd
