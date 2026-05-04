@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-04
+
+Subcommand dispatch is now help-driven instead of substring-matching
+"REVSET", so multi-level subcommands and non-`-r` revset flags work.
+
+### Fixed
+
+- `jjf bm main` (where `bm` is a user alias for `bookmark move`) now
+  correctly emits `jj bm main --to <picked>` instead of `-r <picked>`,
+  which jj rejected. jjf parses the leaf's `Options:` block and picks
+  `-r`/`--revision[s]` first, then `-t, --to`. `--from` is intentionally
+  not a fallback (different semantics).
+- `jjf tag set v0.2.0` no longer errors with "doesn't take revisions".
+  jjf now walks into multi-level subcommands by parsing each parent's
+  `Commands:` block, so `tag set`, `bookmark move`, `git push`, etc.
+  resolve to their actual leaf and read its real flag set.
+
+### Added
+
+- Bypass mode when the user already passed a revset flag in their args.
+  `jjf describe -r @-` now runs verbatim instead of double-injecting
+  `-r`. Triggers on any of `-r`, `--revision`, `--revisions`, `-t`,
+  `--to` in passthrough.
+- Refusal message for leaves with no revset flag now includes the
+  resolved leaf path (e.g. `jjf workspace list` → "'jj workspace list'
+  takes no revset flag — run 'jj workspace list' directly") so users
+  see exactly which command jjf landed on.
+- Unit tests for the help parsers and command-line construction
+  against captured fixtures of `jj tag set --help`,
+  `jj bookmark move --help`, and `jj tag --help`.
+
+[0.3.0]: https://github.com/swaits/jjf/releases/tag/v0.3.0
+
 ## [0.2.0] — 2026-04-29
 
 Picker now renders jj's real graph (merge connectors and all), with the
