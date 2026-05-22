@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-22
+
+Restores `jj show` support, which the 0.3.0 dispatch rewrite broke:
+bare `jjf` (which defaults to `show`) works again, and a revision
+named as a bare positional bypasses the picker.
+
+### Fixed
+
+- Bare `jjf` (which defaults to the `show` subcommand) no longer errors
+  with "'jj show' takes no revset flag (-r/--to)". The 0.3.0 help-driven
+  dispatch only scanned a leaf's `Options:` block, but `jj show` accepts
+  its revision as a positional `[REVSET]` argument. jjf now also reads
+  the `Arguments:` block and recognizes a positional revset that exposes
+  `-r` as an alias, injecting `-r <picked>` as before.
+- `jjf show <rev>` (a revision passed as a bare positional, e.g.
+  `jjf show @-`) now bypasses the picker and runs verbatim, instead of
+  launching the picker and appending a second, conflicting `-r`. The
+  bypass check previously only recognized explicit revset *flags*; it
+  now also recognizes a bare positional for positional-revset leaves.
+  Option values are not mistaken for positionals — jjf reads the leaf's
+  full option set (including `Global Options:`) to step over them, so
+  `jjf show -T <template>` still opens the picker.
+
+### Added
+
+- The bypass check also recognizes the inline `--revision=<rev>` /
+  `--to=<rev>` form, not just space-separated flags.
+
+[0.4.0]: https://github.com/swaits/jjf/releases/tag/v0.4.0
+
 ## [0.3.0] — 2026-05-04
 
 Subcommand dispatch is now help-driven instead of substring-matching
