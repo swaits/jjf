@@ -289,12 +289,16 @@ impl RevsetFlag {
 /// the resolved subcommand path (preserving the user's tokens, including
 /// aliases like `bm` — jj resolves them again at exec time). `passthrough`
 /// is everything after the leaf. `flag` is `None` when the leaf accepts no
-/// revset; in that case jjf refuses to run the picker.
+/// revset; in that case jjf refuses to run the picker. `user_supplied_revset`
+/// is true when the passthrough already pins down the revision (a revset
+/// flag, or a bare positional for a positional-revset leaf like `jj show`),
+/// in which case jjf bypasses the picker and runs the command verbatim.
 #[derive(Debug, Clone)]
 pub struct RevsetTarget {
     pub leaf: Vec<String>,
     pub passthrough: Vec<String>,
     pub flag: Option<RevsetFlag>,
+    pub user_supplied_revset: bool,
 }
 
 pub fn resolve_target(args: &[String]) -> Result<RevsetTarget> {
@@ -310,6 +314,8 @@ pub fn resolve_target(args: &[String]) -> Result<RevsetTarget> {
                 leaf: vec![args[0].clone()],
                 passthrough: args[1..].to_vec(),
                 flag: Some(RevsetFlag::Revision),
+                // No help to consult — fall back to a plain revset-flag scan.
+                user_supplied_revset: has_revset_flag(&args[1..]),
             });
         }
     };
@@ -317,11 +323,13 @@ pub fn resolve_target(args: &[String]) -> Result<RevsetTarget> {
     let (leaf, leaf_help) = resolve_leaf(args, first_help)?;
     let passthrough = args[leaf.len()..].to_vec();
     let flag = parse_revset_flag(&leaf_help);
+    let user_supplied_revset = passthrough_pins_revset(&passthrough, &leaf_help);
 
     Ok(RevsetTarget {
         leaf,
         passthrough,
         flag,
+        user_supplied_revset,
     })
 }
 
@@ -414,8 +422,9 @@ fn scan_aliases(line: &str, names: &mut std::collections::HashSet<String>) {
 }
 
 /// Pick the right revset-accepting flag from a leaf's help, preferring
-/// `-r`/`--revision[s]` over `-t, --to`. Returns `None` if the leaf has
-/// neither.
+/// `-r`/`--revision[s]` over `-t, --to`. Falls back to a positional
+/// `[REVSET]` argument that exposes `-r` as an alias (this is how `jj show`
+/// takes a revision). Returns `None` if the leaf has none of those.
 pub fn parse_revset_flag(help: &str) -> Option<RevsetFlag> {
     let opts = parse_options(help);
     for opt in &opts {
@@ -433,35 +442,180 @@ pub fn parse_revset_flag(help: &str) -> Option<RevsetFlag> {
             return Some(RevsetFlag::To);
         }
     }
+    // No revset *option* — fall back to a positional `[REVSET]` argument.
+    // `jj show` accepts its revision this way; clap annotates the positional
+    // with `[aliases: -r]` precisely so tools can inject it as `-r <rev>`.
+    if positional_revset_accepts_r(help) {
+        return Some(RevsetFlag::Revision);
+    }
     None
+}
+
+/// True when the leaf takes its revset as a positional `[REVSET]`/`[REVSETS]`
+/// argument that exposes `-r` (or `--revision`) as an alias. Such a positional
+/// lives in the `Arguments:` block, which `parse_options` never scans, so
+/// without this `jj show` would look like it accepts no revset at all.
+///
+/// The `-r` alias is required: jjf's dispatch injects the picked revision via
+/// a flag, so a bare positional with no alias can't be targeted.
+fn positional_revset_accepts_r(help: &str) -> bool {
+    let mut in_args = false;
+    let mut current_is_revset = false;
+    for line in help.lines() {
+        if line == "Arguments:" {
+            in_args = true;
+            continue;
+        }
+        if !in_args {
+            continue;
+        }
+        // A non-indented non-empty line ends the `Arguments:` block.
+        if !line.is_empty() && !line.starts_with(' ') {
+            break;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        // New positional entry: 2-space indent, `[NAME]` or `<NAME>` (e.g.
+        // `[REVSET]`, `<NAMES>...`, `[FILESETS]...`). Deeper indent is a
+        // description / continuation line for the current entry.
+        if indent == 2 && trimmed.starts_with(['[', '<']) {
+            let name = trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(['[', ']', '<', '>'])
+                .trim_end_matches("...")
+                .trim_matches(['[', ']', '<', '>']);
+            current_is_revset = matches!(name, "REVSET" | "REVSETS");
+        }
+        // `[aliases: …]` for a positional appears on its description line.
+        if current_is_revset && line.contains("[aliases:") {
+            let mut aliases = std::collections::HashSet::new();
+            scan_aliases(line, &mut aliases);
+            if aliases.iter().any(|a| a == "-r" || a == "--revision") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether the user's own args already pin down the revision, so jjf should
+/// skip the picker and run their command verbatim. True when the passthrough
+/// carries an explicit revset flag, or — for a leaf whose revset is a
+/// positional `[REVSET]` argument (`jj show`) — when it carries a bare
+/// positional token.
+fn passthrough_pins_revset(passthrough: &[String], leaf_help: &str) -> bool {
+    if has_revset_flag(passthrough) {
+        return true;
+    }
+    if positional_revset_accepts_r(leaf_help) {
+        return passthrough_has_bare_positional(passthrough, &value_flags(leaf_help));
+    }
+    false
+}
+
+/// True when the passthrough already carries an explicit revset flag
+/// (`-r`/`--revision`/`--revisions`/`-t`/`--to`), whether as its own token or
+/// in long-flag `--flag=value` form.
+fn has_revset_flag(passthrough: &[String]) -> bool {
+    passthrough.iter().any(|a| {
+        let name = a.split('=').next().unwrap_or(a);
+        matches!(name, "-r" | "--revision" | "--revisions" | "-t" | "--to")
+    })
+}
+
+/// Scan a leaf's passthrough args for a bare positional token — one that is
+/// neither an option flag nor consumed as the value of one. `value_flags` is
+/// the set of option spellings known to take a following value, so `-T tmpl`
+/// or `--color always` aren't mistaken for a positional. For a positional-
+/// revset leaf, a bare positional means the user already named the revision.
+fn passthrough_has_bare_positional(
+    passthrough: &[String],
+    value_flags: &std::collections::HashSet<String>,
+) -> bool {
+    let mut i = 0;
+    while i < passthrough.len() {
+        let tok = passthrough[i].as_str();
+        if tok == "--" {
+            // Everything after a bare `--` is positional.
+            return i + 1 < passthrough.len();
+        }
+        if let Some(body) = tok.strip_prefix("--") {
+            // Long flag. `--flag=value` carries its value inline; otherwise a
+            // value-taking flag consumes the next token.
+            let name = format!("--{}", body.split('=').next().unwrap_or(body));
+            if !body.contains('=') && value_flags.contains(&name) {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if tok.starts_with('-') && tok.len() > 1 {
+            // Short flag. `-r value` consumes the next token; an attached
+            // value (`-rvalue`) or bundled bool shorts (`-sw`) do not.
+            if value_flags.contains(tok) {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // Not a flag and not consumed as a value — a positional argument.
+        return true;
+    }
+    false
+}
+
+/// Every option spelling (short `-x` and long `--long`) that consumes a
+/// following value token, gathered across all of a leaf's `Options:` sections.
+fn value_flags(help: &str) -> std::collections::HashSet<String> {
+    let mut flags = std::collections::HashSet::new();
+    for opt in parse_options(help) {
+        if opt.takes_value {
+            for f in opt.shorts.into_iter().chain(opt.longs) {
+                flags.insert(f);
+            }
+        }
+    }
+    flags
 }
 
 #[derive(Debug)]
 struct OptionEntry {
+    shorts: Vec<String>,
     longs: Vec<String>,
+    /// True when the header carried a `<PLACEHOLDER>` — i.e. the option
+    /// consumes a following value token.
+    takes_value: bool,
     /// True when the placeholder is `<REVSET>` or `<REVSETS>`.
     is_revset: bool,
 }
 
+/// Parse every option section of a leaf's help — the primary `Options:`, any
+/// categorized `<Category> Options:`, and `Global Options:` — into a flat list
+/// of entries. `[aliases: …]` continuation lines are folded into the owning
+/// entry's name lists.
 fn parse_options(help: &str) -> Vec<OptionEntry> {
     let mut opts = Vec::new();
     let mut in_options = false;
     let mut current: Option<OptionEntry> = None;
 
     for line in help.lines() {
-        if line == "Options:" {
-            in_options = true;
-            continue;
-        }
-        if !in_options {
-            continue;
-        }
-        // A non-indented non-empty line ends `Options:` (e.g. `Global Options:`).
+        // Section headers are non-indented, non-empty lines. Option entries
+        // live only under a header ending in `Options:` — `Arguments:`,
+        // `Commands:`, and the intro paragraph switch parsing back off.
         if !line.is_empty() && !line.starts_with(' ') {
             if let Some(o) = current.take() {
                 opts.push(o);
             }
-            break;
+            in_options = line.ends_with("Options:");
+            continue;
+        }
+        if !in_options {
+            continue;
         }
         if line.is_empty() {
             // Blank lines separate options inside the section; don't end it.
@@ -482,13 +636,15 @@ fn parse_options(help: &str) -> Vec<OptionEntry> {
             }
             current = Some(parse_option_header(trimmed));
         } else if let Some(ref mut o) = current {
-            // Continuation line. Pull any `[aliases: --foo, --bar]` into the
-            // current option's long-name set so the priority match sees them.
+            // Continuation line. Pull any `[aliases: --foo, -x]` into the
+            // current option's name sets so callers see alias spellings too.
             let mut alias_set = std::collections::HashSet::new();
             scan_aliases(line, &mut alias_set);
             for n in alias_set {
                 if n.starts_with("--") {
                     o.longs.push(n);
+                } else if n.starts_with('-') {
+                    o.shorts.push(n);
                 }
             }
         }
@@ -500,6 +656,7 @@ fn parse_options(help: &str) -> Vec<OptionEntry> {
 }
 
 fn parse_option_header(s: &str) -> OptionEntry {
+    let mut shorts = Vec::new();
     let mut longs = Vec::new();
     let mut placeholder: Option<String> = None;
     for token in s.split(|c: char| c == ',' || c.is_whitespace()) {
@@ -512,6 +669,9 @@ fn parse_option_header(s: &str) -> OptionEntry {
             // today, but cheap insurance).
             let name = rest.split('=').next().unwrap_or(rest);
             longs.push(format!("--{name}"));
+        } else if t.starts_with('-') {
+            // Short flag, e.g. `-r`.
+            shorts.push(t.to_string());
         } else if let Some(stripped) = t.strip_prefix('<') {
             // Placeholder: `<REVSET>`, `<REVSETS>`, `<NAMES>...`, etc.
             let inner = stripped.trim_end_matches("...");
@@ -521,7 +681,12 @@ fn parse_option_header(s: &str) -> OptionEntry {
         }
     }
     let is_revset = matches!(placeholder.as_deref(), Some("REVSET") | Some("REVSETS"));
-    OptionEntry { longs, is_revset }
+    OptionEntry {
+        shorts,
+        longs,
+        takes_value: placeholder.is_some(),
+        is_revset,
+    }
 }
 
 pub fn exec(target: &RevsetTarget, ids: &[String]) -> Result<ExitStatus> {
@@ -655,6 +820,69 @@ Global Options:
           Path to repository
 ";
 
+    const SHOW_HELP: &str = "Show commit description and changes in a revision
+
+Usage: jj show [OPTIONS] [REVSET]
+
+Arguments:
+  [REVSET]
+          Show changes in this revision, compared to its parent(s) [default: @] [aliases: -r]
+
+Options:
+  -T, --template <TEMPLATE>
+          Render a revision using the given template
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Diff Formatting Options:
+  -s, --summary
+          For each path, show only whether it was modified, added, or deleted
+
+      --tool <TOOL>
+          Generate diff by external command
+
+Global Options:
+  -R, --repository <REPOSITORY>
+          Path to repository
+";
+
+    // A leaf with a positional revset but no `-r` alias jjf could inject.
+    const LOG_HELP: &str = "Show revision history
+
+Usage: jj log [OPTIONS] [FILESETS]...
+
+Arguments:
+  [FILESETS]...
+          Show revisions modifying the given paths
+
+Options:
+  -r, --revision <REVSETS>
+          Which revisions to show
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global Options:
+  -R, --repository <REPOSITORY>
+          Path to repository
+";
+
+    #[test]
+    fn revset_flag_detects_show_positional() {
+        // `jj show` takes its revset as the positional `[REVSET]` argument,
+        // annotated `[aliases: -r]`. jjf must inject `-r <picked>`.
+        assert_eq!(parse_revset_flag(SHOW_HELP), Some(RevsetFlag::Revision));
+    }
+
+    #[test]
+    fn revset_flag_log_uses_option_not_positional() {
+        // `jj log` has a `[FILESETS]...` positional (not a revset) and a real
+        // `-r, --revision` option — the option must drive the result.
+        assert_eq!(parse_revset_flag(LOG_HELP), Some(RevsetFlag::Revision));
+        assert!(!positional_revset_accepts_r(LOG_HELP));
+    }
+
     #[test]
     fn revset_flag_prefers_revision_over_to_alias() {
         // tag set has `-r, --revision <REVSET>` with `[aliases: --to]`.
@@ -693,6 +921,7 @@ Global Options:
             leaf: vec!["tag".into(), "set".into()],
             passthrough: vec!["v0.2.0".into()],
             flag: Some(RevsetFlag::Revision),
+            user_supplied_revset: false,
         };
         let s = command_line(&target, &["abcd1234".into()]);
         assert_eq!(s, "jj tag set v0.2.0 -r abcd1234");
@@ -704,6 +933,7 @@ Global Options:
             leaf: vec!["bm".into()],
             passthrough: vec!["main".into()],
             flag: Some(RevsetFlag::To),
+            user_supplied_revset: false,
         };
         let s = command_line(&target, &["abcd1234".into()]);
         assert_eq!(s, "jj bm main --to abcd1234");
@@ -715,10 +945,81 @@ Global Options:
             leaf: vec!["describe".into()],
             passthrough: vec!["-r".into(), "@".into()],
             flag: Some(RevsetFlag::Revision),
+            user_supplied_revset: true,
         };
         // When the user already supplied -r, jjf calls command_line with empty
         // ids — no extra flag should be appended.
         let s = command_line(&target, &[]);
         assert_eq!(s, "jj describe -r @");
+    }
+
+    fn pins(passthrough: &[&str], help: &str) -> bool {
+        let owned: Vec<String> = passthrough.iter().map(|s| s.to_string()).collect();
+        passthrough_pins_revset(&owned, help)
+    }
+
+    #[test]
+    fn show_bare_positional_pins_revset() {
+        // `jjf show @` / `jjf show abc123` — the revision is already named as
+        // the positional `[REVSET]`, so jjf must bypass the picker.
+        assert!(pins(&["@"], SHOW_HELP));
+        assert!(pins(&["abc123"], SHOW_HELP));
+        assert!(pins(&["@", "--summary"], SHOW_HELP));
+        assert!(pins(&["--summary", "@"], SHOW_HELP));
+    }
+
+    #[test]
+    fn show_without_revision_runs_picker() {
+        // No revision named — jjf should fall through to the picker. Bare
+        // `jjf show`, and `jjf show` with only flags, must NOT count as pinned.
+        assert!(!pins(&[], SHOW_HELP));
+        assert!(!pins(&["--summary"], SHOW_HELP));
+        assert!(!pins(&["-s"], SHOW_HELP));
+    }
+
+    #[test]
+    fn show_option_value_is_not_a_positional() {
+        // The value of a value-taking option must not be mistaken for the
+        // positional revset: `-T tmpl` / `--tool meld` still want the picker.
+        assert!(!pins(&["-T", "mytemplate"], SHOW_HELP));
+        assert!(!pins(&["--tool", "meld"], SHOW_HELP));
+        // ...but a real positional alongside such an option still pins it.
+        assert!(pins(&["-T", "mytemplate", "@"], SHOW_HELP));
+    }
+
+    #[test]
+    fn show_explicit_revset_flag_pins_revset() {
+        // The `-r` alias and the `--revision=@` inline form both count.
+        assert!(pins(&["-r", "@"], SHOW_HELP));
+        assert!(pins(&["--revision=@"], SHOW_HELP));
+    }
+
+    #[test]
+    fn dashdash_separates_positionals() {
+        assert!(pins(&["--", "@"], SHOW_HELP));
+        assert!(!pins(&["--"], SHOW_HELP));
+    }
+
+    #[test]
+    fn option_leaf_bare_positional_does_not_pin_revset() {
+        // `jj tag set v0.2.0` — `v0.2.0` is the `<NAMES>` positional, NOT a
+        // revset. Only an explicit `-r`/`--to` flag pins the revision here, so
+        // jjf still runs the picker for the target revision.
+        assert!(!pins(&["v0.2.0"], TAG_SET_HELP));
+        assert!(pins(&["v0.2.0", "-r", "@"], TAG_SET_HELP));
+    }
+
+    #[test]
+    fn value_flags_span_all_option_sections() {
+        // Value-taking flags are gathered from `Options:`, the categorized
+        // `Diff Formatting Options:`, and `Global Options:` alike; bool flags
+        // and `--help` are excluded.
+        let vf = value_flags(SHOW_HELP);
+        for f in ["-T", "--template", "--tool", "-R", "--repository"] {
+            assert!(vf.contains(f), "missing value flag {f} in {vf:?}");
+        }
+        for f in ["-s", "--summary", "-h", "--help"] {
+            assert!(!vf.contains(f), "{f} should not be a value flag");
+        }
     }
 }

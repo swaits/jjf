@@ -68,10 +68,11 @@ fn run_init(mut args: impl Iterator<Item = String>) -> Result<u8> {
 fn run_pick(args: &[String], emit: bool) -> Result<u8> {
     let target = jj::resolve_target(args)?;
 
-    // Case 1: user already supplied a revset flag — bypass the picker entirely
-    // and run their command verbatim. Avoids double-`-r` and respects what
-    // they explicitly asked for.
-    if has_user_revset_flag(&target.passthrough) {
+    // Case 1: user already pinned the revision — a revset flag, or a bare
+    // positional for a positional-revset leaf like `jj show`. Bypass the
+    // picker entirely and run their command verbatim. Avoids double-`-r` and
+    // respects what they explicitly asked for.
+    if target.user_supplied_revset {
         if emit {
             let cmd = jj::command_line(&target, &[]);
             println!("{cmd}");
@@ -130,15 +131,6 @@ fn run_pick(args: &[String], emit: bool) -> Result<u8> {
         let status = jj::exec(&target, &ids)?;
         Ok(status.code().unwrap_or(1) as u8)
     }
-}
-
-fn has_user_revset_flag(passthrough: &[String]) -> bool {
-    passthrough.iter().any(|a| {
-        matches!(
-            a.as_str(),
-            "-r" | "--revision" | "--revisions" | "-t" | "--to"
-        )
-    })
 }
 
 #[cfg(unix)]
